@@ -3,93 +3,143 @@ import bodyParser from "body-parser";
 import fetch from "node-fetch";
 import sqlite3 from "sqlite3";
 import { open } from "sqlite";
+import dotenv from "dotenv";
+
+dotenv.config(); // Load .env if running locally
 
 const app = express();
+const PORT = process.env.PORT || 3000;
 app.use(bodyParser.json());
 
-// 🚨 Your API key is hardcoded here (NOT safe for production)
-const GEMINI_API_KEY = "AIzaSyCi_13LJlwK0DAviYERyqTKg47GngBSeb8";
+// ✅ Securely load Gemini API key from environment variables
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-// Setup SQLite DB
+if (!GEMINI_API_KEY) {
+  console.error("❌ Missing GEMINI_API_KEY in environment variables!");
+  process.exit(1);
+}
+
+// ✅ Initialize SQLite database
 let db;
 (async () => {
   db = await open({
-    filename: "./chat_history.db",
-    driver: sqlite3.Database
+    filename: "./chat-history.db",
+    driver: sqlite3.Database,
   });
-  await db.exec(
-    "CREATE TABLE IF NOT EXISTS chats (id INTEGER PRIMARY KEY, sessionId TEXT, role TEXT, message TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)"
-  );
+
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS chat_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT,
+      role TEXT,
+      message TEXT,
+      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  console.log("✅ SQLite database ready.");
 })();
 
-// Save message to DB
+// 🔹 Save a chat message
 async function saveMessage(sessionId, role, message) {
   await db.run(
-    "INSERT INTO chats (sessionId, role, message) VALUES (?, ?, ?)",
+    "INSERT INTO chat_history (session_id, role, message) VALUES (?, ?, ?)",
     [sessionId, role, message]
   );
 }
 
-// Get conversation history
+// 🔹 Get chat history for a session
 async function getHistory(sessionId) {
-  return db.all("SELECT role, message FROM chats WHERE sessionId = ?", [
-    sessionId
-  ]);
+  return await db.all(
+    "SELECT role, message, timestamp FROM chat_history WHERE session_id = ? ORDER BY id ASC",
+    [sessionId]
+  );
 }
 
-// AI endpoint
-app.post("/ask-ai", async (req, res) => {
-  const { sessionId, prompt } = req.body;
-  if (!prompt) return res.status(400).json({ error: "Prompt required" });
+// 🔹 Ask Gemini API
+async function askGemini(prompt, contextMessages = []) {
+  const response = await fetch(
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=" +
+      GEMINI_API_KEY,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [
+          ...contextMessages.map((msg) => ({
+            role: msg.role,
+            parts: [{ text: msg.message }],
+          })),
+          {
+            role: "user",
+            parts: [{ text: prompt }],
+          },
+        ],
+      }),
+    }
+  );
 
-  // Save user prompt
-  await saveMessage(sessionId, "user", prompt);
-
-  // Get history
-  const history = await getHistory(sessionId);
-  const context = history
-    .map(h => `${h.role.toUpperCase()}: ${h.message}`)
-    .join("\\n");
-
+  const data = await response.json();
   try {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=${GEMINI_API_KEY}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [
-            {
-              parts: [
-                {
-                  text: `Conversation so far:\\n${context}\\n\\nUser: ${prompt}`
-                }
-              ]
-            }
-          ]
-        })
-      }
-    );
+    return data.candidates?.[0]?.content?.parts?.[0]?.text || "⚠️ No response";
+  } catch (e) {
+    console.error("Gemini error:", data);
+    return "⚠️ Gemini API error.";
+  }
+}
 
-    const data = await response.json();
-    const aiMessage =
-      data.candidates?.[0]?.content?.parts?.[0]?.text ||
-      "Sorry, I couldn't generate a response.";
+// 🔹 POST /ask-ai (Send message to Gemini)
+app.post("/ask-ai", async (req, res) => {
+  try {
+    const { sessionId, prompt } = req.body;
+    if (!sessionId || !prompt) {
+      return res
+        .status(400)
+        .json({ error: "sessionId and prompt are required." });
+    }
 
-    await saveMessage(sessionId, "assistant", aiMessage);
-    res.json({ reply: aiMessage });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "AI request failed" });
+    // Fetch context (last 10 messages)
+    const context = await getHistory(sessionId);
+    const recentContext = context.slice(-10);
+
+    // Save user message
+    await saveMessage(sessionId, "user", prompt);
+
+    // Get AI response
+    const aiResponse = await askGemini(prompt, recentContext);
+
+    // Save AI message
+    await saveMessage(sessionId, "assistant", aiResponse);
+
+    res.json({ reply: aiResponse });
+  } catch (error) {
+    console.error("Error in /ask-ai:", error);
+    res.status(500).json({ error: "Internal Server Error" });
   }
 });
 
-// Get chat history
+// 🔹 GET /history (Retrieve session chat)
 app.get("/history", async (req, res) => {
-  const { sessionId } = req.query;
-  const history = await getHistory(sessionId);
-  res.json(history);
+  try {
+    const { sessionId } = req.query;
+    if (!sessionId) {
+      return res.status(400).json({ error: "sessionId is required." });
+    }
+
+    const history = await getHistory(sessionId);
+    res.json({ history });
+  } catch (error) {
+    console.error("Error in /history:", error);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+// 🔹 Root route
+app.get("/", (req, res) => {
+  res.send("✅ AI Memory API is running!");
+});
+
+// 🔹 Start server
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+});
