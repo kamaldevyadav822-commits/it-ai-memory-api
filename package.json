@@ -1,12 +1,20 @@
 {
-  "name": "ai-memory-api",
+  "name": "ai-sql-compiler",
   "version": "1.0.0",
-  "main": "server.js",
   "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
   "dependencies": {
-    "express": "^4.18.2",
+    "express": "^4.19.2",
     "body-parser": "^1.20.2",
     "sqlite3": "^5.1.6",
+    "sqlite": "^4.2.1",
+    "cors": "^2.8.5",
     "node-fetch": "^3.3.2"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
